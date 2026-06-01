@@ -1,0 +1,1551 @@
+import os
+import json
+import time
+import re
+import shutil                          # FIX: needed for detect_binaries / shutil.which
+from dotenv import load_dotenv
+import requests
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service   # FIX: explicit service object
+from selenium.webdriver.chrome.options import Options   # FIX: typed options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from datetime import datetime
+import itertools
+import threading
+import random
+import queue
+from tqdm import tqdm
+from bio_location import extract_location_from_bio
+
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    _HAS_WDM = True
+except ImportError:
+    _HAS_WDM = False
+
+# ==================== CONFIGURATION ====================
+
+class ScraperConfig:
+    def __init__(
+        self,
+        SESSION_IDS,
+        MAX_WORKERS=4,
+        MAX_POSTS=35,
+        HEADLESS=True,
+        INPUT_FILE="input.csv",
+        DONE_FILE="inputdone.csv",
+        TEST_MODE=False,
+        MAX_TEST_PROFILES=5,
+        MAX_VISIBLE_POSTS=25,
+    ):
+        self.SESSION_IDS        = SESSION_IDS
+        self.MAX_WORKERS        = MAX_WORKERS
+        self.MAX_POSTS          = MAX_POSTS
+        self.HEADLESS           = HEADLESS
+        self.INPUT_FILE         = INPUT_FILE
+        self.DONE_FILE          = DONE_FILE
+        self.TEST_MODE          = TEST_MODE
+        self.MAX_TEST_PROFILES  = MAX_TEST_PROFILES
+        self.MAX_VISIBLE_POSTS  = MAX_VISIBLE_POSTS
+
+        self.TARGET_QUERIES = {
+            "profile":  "user",
+            "timeline": "xdt_api__v1__feed__user_timeline_graphql_connection",
+        }
+
+        # ── Scroll / timing ────────────────────────────────────────────────
+        self.PAGE_LOAD_WAIT      = 1.0
+        self.SCROLL_PAUSE_MIN    = 0.7
+        self.SCROLL_PAUSE_MAX    = 1.1
+        self.MAX_SCROLL_ATTEMPTS = 8
+        self.MAX_NO_NEW_POSTS    = 3
+
+
+# ==================== GLOBAL STATE ====================
+
+stats_lock      = threading.Lock()
+done_urls_lock  = threading.Lock()
+file_write_lock = threading.Lock()
+
+
+# ==================== LOGGING ====================
+
+def log_message(message, level="INFO"):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    icons  = {"INFO": "i", "SUCCESS": "√", "WARNING": "!", "ERROR": "×"}
+    colors = {
+        "INFO":    "\033[94m",
+        "SUCCESS": "\033[92m",
+        "WARNING": "\033[93m",
+        "ERROR":   "\033[91m",
+    }
+    icon  = icons.get(level, "i")
+    color = colors.get(level, "\033[0m")
+    try:
+        print(f"{color}[{timestamp}] [{icon}] {message}\033[0m", flush=True)
+    except UnicodeEncodeError:
+        print(f"[{timestamp}] [{level}] {message}", flush=True)
+
+
+# ==================== BINARY DETECTION ====================
+# Root cause of the "Unable to obtain driver" error on Ubuntu servers:
+# Selenium Manager tries to download chromedriver from the internet, which
+# fails if the server has no outbound access or the wrong Chrome version.
+# Instead we find the real local binary and pass it explicitly via Service().
+
+def _snap_chromium_paths():
+    """
+    Return (chrome_bin, chromedriver_bin) for snap-installed Chromium, or
+    (None, None) if snap is not present.
+
+    /snap/bin/chromium is a shell *wrapper* — Selenium cannot exec it as a
+    binary.  The real ELF lives inside /snap/chromium/current/usr/lib/…
+    """
+    snap_base = "/snap/chromium"
+    if not os.path.isdir(snap_base):
+        return None, None
+    try:
+        real = os.path.realpath(os.path.join(snap_base, "current"))
+        # Two path conventions exist across snap versions
+        candidates = [
+            (
+                os.path.join(real, "usr/lib/chromium-browser/chrome"),
+                os.path.join(real, "usr/lib/chromium-browser/chromedriver"),
+            ),
+            (
+                os.path.join(real, "usr/lib/chromium/chrome"),
+                os.path.join(real, "usr/lib/chromium/chromedriver"),
+            ),
+        ]
+        for cb, cd in candidates:
+            if os.path.exists(cb):
+                return cb, (cd if os.path.exists(cd) else None)
+        return None, None
+    except Exception:
+        return None, None
+
+
+def detect_binaries():
+    """
+    Find Chrome/Chromium binary + matching chromedriver on this machine.
+    Returns dict with keys 'chrome' and 'chromedriver' (values may be None).
+
+    Search order:
+      1. Snap Chromium real binary  (/snap/chromium/current/…)
+      2. Distro package paths       (/usr/bin/google-chrome-stable, etc.)
+      3. PATH via shutil.which
+      4. webdriver-manager          (last resort, downloads if needed)
+    """
+    result = {"chrome": None, "chromedriver": None}
+
+    # 1. Snap
+    snap_chrome, snap_driver = _snap_chromium_paths()
+    if snap_chrome:
+        result["chrome"] = snap_chrome
+    if snap_driver:
+        result["chromedriver"] = snap_driver
+
+    # 2. System paths for the chrome binary
+    if not result["chrome"]:
+        for b in [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+        ]:
+            if os.path.exists(b):
+                result["chrome"] = b
+                break
+
+    # 3. PATH fallback for chrome
+    if not result["chrome"]:
+        result["chrome"] = (
+            shutil.which("google-chrome-stable")
+            or shutil.which("google-chrome")
+            or shutil.which("chromium-browser")
+            or shutil.which("chromium")
+        )
+
+    # 2+3. System paths for chromedriver
+    if not result["chromedriver"]:
+        for d in ["/usr/bin/chromedriver", "/usr/local/bin/chromedriver"]:
+            if os.path.exists(d):
+                result["chromedriver"] = d
+                break
+
+    if not result["chromedriver"]:
+        result["chromedriver"] = (
+            shutil.which("chromedriver")
+            or shutil.which("chromium-driver")
+        )
+
+    # 4. webdriver-manager as last resort
+    if not result["chromedriver"] and _HAS_WDM:
+        try:
+            log_message("chromedriver not found locally — trying webdriver-manager…", level="WARNING")
+            result["chromedriver"] = ChromeDriverManager().install()
+        except Exception as e:
+            log_message(f"webdriver-manager failed: {e}", level="WARNING")
+
+    return result
+
+
+# Cache binary detection so we only pay the cost once per process
+_BINS      = None
+_BINS_LOCK = threading.Lock()
+
+def _get_bins():
+    global _BINS
+    with _BINS_LOCK:
+        if _BINS is None:
+            _BINS = detect_binaries()
+            log_message(f"Chrome binary:     {_BINS.get('chrome') or 'NOT FOUND'}")
+            log_message(f"ChromeDriver:      {_BINS.get('chromedriver') or 'NOT FOUND'}")
+            if not _BINS.get("chrome") or not _BINS.get("chromedriver"):
+                log_message(
+                    "Fix: sudo apt install chromium-browser chromium-chromedriver\n"
+                    "  OR: pip install webdriver-manager --break-system-packages",
+                    level="WARNING",
+                )
+    return _BINS
+
+
+# ==================== DRIVER ====================
+
+def configure_driver(session_id, config, proxy=None):
+    """
+    Create a Chrome/Chromium driver with CDP performance logging.
+
+    KEY FIXES vs original:
+      - detect_binaries() finds the real binary on this server instead of
+        letting Selenium Manager try to download from the internet (which
+        fails on servers and snap environments).
+      - Service(executable_path=…) pins the exact chromedriver so there is
+        no version-mismatch guess work.
+      - options.binary_location pins the real ELF binary (critical for snap).
+      - --remote-debugging-port=0 picks an ephemeral port, avoids conflicts
+        when multiple workers start simultaneously.
+      - WebDriverWait replaces bare time.sleep for cookie injection.
+
+    Returns driver on success, None on failure.
+    """
+    bins = _get_bins()
+    options = webdriver.ChromeOptions()
+
+    # ── Binary location (critical for snap Chromium) ──────────────────────
+    if bins.get("chrome"):
+        options.binary_location = bins["chrome"]
+
+    # ── Headless ──────────────────────────────────────────────────────────
+    if config.HEADLESS:
+        options.add_argument("--headless=new")  # Chrome 112+ headless mode
+
+    # ── Server / sandbox flags ────────────────────────────────────────────
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--disable-dev-shm-usage")    # use /tmp instead of tiny /dev/shm
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-browser-side-navigation")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--mute-audio")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--remote-debugging-port=0")  # ephemeral port — no conflicts
+    options.add_argument("--js-flags=--max-old-space-size=256")
+
+    # ── Speed: skip unnecessary background work ───────────────────────────
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-translate")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--no-first-run")
+
+    # ── Anti-bot ──────────────────────────────────────────────────────────
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    # ── Performance: disable images, video, notifications ─────────────────
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.managed_default_content_settings.videos": 2,
+        "profile.default_content_setting_values.notifications": 2,
+    }
+    options.add_experimental_option("prefs", prefs)
+
+    # ── CDP performance log (required to intercept GraphQL responses) ─────
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
+    if proxy:
+        options.add_argument(f"--proxy-server={proxy}")
+
+    # ── Build Service with the local chromedriver path ────────────────────
+    # Without this, Selenium Manager tries to download from the internet.
+    service_kwargs = {}
+    if bins.get("chromedriver"):
+        service_kwargs["executable_path"] = bins["chromedriver"]
+    service = Service(**service_kwargs)
+
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+    except Exception as e:
+        log_message(f"Failed to create Chrome driver: {e}", level="ERROR")
+        return None
+
+    # ── Post-creation setup ───────────────────────────────────────────────
+    try:
+        driver.execute_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        driver.set_page_load_timeout(30)
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Page.enable", {})
+    except Exception as e:
+        log_message(f"CDP setup failed: {e}", level="WARNING")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        return None
+
+    # ── Inject Instagram session cookie ───────────────────────────────────
+    if session_id:
+        try:
+            driver.get("https://www.instagram.com/")
+            # Wait for page to be interactive (more reliable than a bare sleep)
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return document.readyState")
+                in ("interactive", "complete")
+            )
+            driver.add_cookie({
+                "name":     "sessionid",
+                "value":    session_id,
+                "domain":   ".instagram.com",
+                "path":     "/",
+                "secure":   True,
+                "httpOnly": True,
+            })
+            log_message(f"Session set: ...{session_id[-10:]}")
+        except Exception as e:
+            log_message(f"Cookie injection failed: {e}", level="WARNING")
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            return None
+
+    return driver
+
+
+# ==================== HELPERS ====================
+
+def get_username(url):
+    url = url.strip().rstrip("/")
+    return url.split("/")[-1].split("?")[0]
+
+
+def is_private_profile(profile_data):
+    if not profile_data:
+        return False
+    try:
+        user_node = profile_data["data"]["user"]
+        if isinstance(user_node, dict) and isinstance(user_node.get("data"), dict):
+            user_node = user_node["data"]
+        return bool(user_node.get("is_private", False))
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def has_visible_likes_and_comments(node):
+    like_count    = node.get("like_count")
+    comment_count = node.get("comment_count")
+    return (
+        like_count    is not None and isinstance(like_count,    (int, float)) and
+        comment_count is not None and isinstance(comment_count, (int, float))
+    )
+
+
+def count_visible_posts(edges):
+    return sum(
+        1 for e in edges
+        if has_visible_likes_and_comments(e.get("node", {}))
+    )
+
+
+def extract_location_data(node):
+    loc_data = node.get("location")
+    if not loc_data:
+        return None
+    location = {
+        "id":                 loc_data.get("pk") or loc_data.get("id"),
+        "name":               loc_data.get("name"),
+        "lat":                loc_data.get("lat") or loc_data.get("latitude"),
+        "lng":                loc_data.get("lng") or loc_data.get("longitude"),
+        "address":            loc_data.get("address"),
+        "city":               loc_data.get("city"),
+        "short_name":         loc_data.get("short_name"),
+        "facebook_places_id": loc_data.get("facebook_places_id"),
+    }
+    location = {k: v for k, v in location.items() if v is not None}
+    return location or None
+
+
+def extract_post_metrics(node):
+    view_count = (
+        node.get("play_count")
+        or node.get("view_count")
+        or node.get("ig_play_count")
+    )
+    repost_count = (
+        node.get("reshare_count")
+        or node.get("ig_reshare_count")
+        or node.get("repost_count")
+    )
+    return {
+        "like_count":    node.get("like_count"),
+        "comment_count": node.get("comment_count"),
+        "view_count":    view_count,
+        "repost_count":  repost_count,
+        "media_type":    node.get("media_type"),
+    }
+
+
+def extract_mentions(node):
+    mentions = set()
+    caption_text = ""
+    caption = node.get("caption")
+    if isinstance(caption, dict):
+        caption_text = caption.get("text", "") or ""
+    elif isinstance(caption, str):
+        caption_text = caption
+    if caption_text:
+        mentions.update(re.findall(r"@([\w.]+)", caption_text))
+    usertags = node.get("usertags", {}) or {}
+    for tag in usertags.get("in", []):
+        uname = (tag.get("user") or {}).get("username")
+        if uname:
+            mentions.add(uname)
+    return sorted(mentions)
+
+
+def process_graphql_response(response_body, config):
+    data = {"profile_info": None, "reel_info": None}
+    if not isinstance(response_body, dict):
+        return data
+    response_data = response_body.get("data", {})
+    if not isinstance(response_data, dict):
+        return data
+
+    PROFILE_KEYS = {"biography", "pk", "full_name", "follower_count",
+                    "following_count", "profile_pic_url", "username"}
+
+    user_node = response_data.get("user")
+    if isinstance(user_node, dict):
+        candidate = user_node.get("data") if isinstance(user_node.get("data"), dict) else user_node
+        if PROFILE_KEYS & candidate.keys():
+            data["profile_info"] = response_body
+
+    WEB_PROFILE_KEY = "xdt_api__v1__users__web_profile_info"
+    if not data["profile_info"] and WEB_PROFILE_KEY in response_data:
+        inner = response_data[WEB_PROFILE_KEY]
+        if isinstance(inner, dict):
+            candidate = inner.get("data") if isinstance(inner.get("data"), dict) else inner
+            if PROFILE_KEYS & candidate.keys():
+                data["profile_info"] = response_body
+
+    if config.TARGET_QUERIES["timeline"] in response_data:
+        data["reel_info"] = response_body
+
+    return data
+
+
+def get_network_responses(driver):
+    """Drain the performance log; returns parsed message list."""
+    responses = []
+    try:
+        logs = driver.get_log("performance")
+    except Exception:
+        return responses
+    for log in logs:
+        try:
+            msg = json.loads(log["message"])["message"]
+            if "Network.response" in msg.get("method", ""):
+                responses.append(msg)
+        except Exception:
+            pass
+    return responses
+
+
+def merge_timeline_data(existing_data, new_data, config):
+    if not existing_data:
+        return new_data
+    if not new_data:
+        return existing_data
+    try:
+        key = config.TARGET_QUERIES["timeline"]
+        existing_edges = existing_data["data"][key]["edges"]
+        new_edges      = new_data["data"][key]["edges"]
+        seen_ids = {e["node"]["id"] for e in existing_edges}
+        for edge in new_edges:
+            if edge["node"]["id"] not in seen_ids:
+                existing_edges.append(edge)
+                seen_ids.add(edge["node"]["id"])
+        existing_data["data"][key]["edges"] = existing_edges
+        return existing_data
+    except Exception as e:
+        log_message(f"Error merging timeline: {e}", level="ERROR")
+        return existing_data
+
+
+# ==================== CSV LOCATION PARSING ====================
+
+def _safe_str(val):
+    if val is None:
+        return None
+    try:
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return None
+    except Exception:
+        pass
+    s = str(val).strip()
+    return s if s else None
+
+
+def _safe_float(val):
+    if val is None:
+        return None
+    try:
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return None
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_free_text_location(text):
+    result = {"city": None, "state": None, "country": None}
+    if not text:
+        return result
+
+    country_aliases = {
+        "usa": "USA", "us": "USA", "united states": "USA", "america": "USA",
+        "uk": "UK", "united kingdom": "UK", "england": "UK",
+        "canada": "Canada", "can": "Canada",
+        "australia": "Australia", "aus": "Australia",
+        "india": "India", "ind": "India",
+        "france": "France", "fr": "France",
+        "germany": "Germany", "de": "Germany",
+        "italy": "Italy", "it": "Italy",
+        "spain": "Spain", "es": "Spain",
+        "mexico": "Mexico", "mx": "Mexico",
+        "brazil": "Brazil", "br": "Brazil",
+        "japan": "Japan", "jp": "Japan",
+        "china": "China", "cn": "China",
+        "nepal": "Nepal", "np": "Nepal",
+    }
+
+    us_state_abbr = {
+        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+        "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+        "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+        "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+        "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    }
+    us_state_full = {
+        "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+        "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+        "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+        "maine", "maryland", "massachusetts", "michigan", "minnesota",
+        "mississippi", "missouri", "montana", "nebraska", "nevada",
+        "new hampshire", "new jersey", "new mexico", "new york",
+        "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+        "pennsylvania", "rhode island", "south carolina", "south dakota",
+        "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+        "west virginia", "wisconsin", "wyoming",
+    }
+
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    remaining = list(parts)
+
+    if remaining:
+        last = remaining[-1]
+        lower_last = last.lower()
+        if lower_last in country_aliases:
+            result["country"] = country_aliases[lower_last]
+            remaining.pop()
+
+    if remaining:
+        candidate = remaining[-1]
+        if candidate.upper() in us_state_abbr:
+            result["state"] = candidate.upper()
+            if not result["country"]:
+                result["country"] = "USA"
+            remaining.pop()
+        elif candidate.lower() in us_state_full:
+            result["state"] = candidate.title()
+            if not result["country"]:
+                result["country"] = "USA"
+            remaining.pop()
+
+    if remaining:
+        result["city"] = remaining[0]
+
+    return result
+
+
+def build_csv_location(row_dict):
+    row = {k.lower().strip(): v for k, v in row_dict.items()}
+
+    free_text  = _safe_str(row.get("location"))
+    address    = _safe_str(row.get("address"))
+    city       = _safe_str(row.get("city"))
+    state      = _safe_str(row.get("state"))
+    country    = _safe_str(row.get("country"))
+    latitude   = _safe_float(row.get("latitude") or row.get("lat"))
+    longitude  = _safe_float(row.get("longitude") or row.get("lng") or row.get("lon"))
+
+    if not any([free_text, address, city, state, country, latitude, longitude]):
+        return None
+
+    parsed = parse_free_text_location(free_text) if free_text else {}
+
+    final_city    = city    or parsed.get("city")
+    final_state   = state   or parsed.get("state")
+    final_country = country or parsed.get("country")
+    final_address = address or (free_text if not any([city, state, country]) else "")
+
+    return {
+        "address":   final_address or "",
+        "city":      final_city,
+        "country":   final_country,
+        "state":     final_state,
+        "latitude":  latitude,
+        "longitude": longitude,
+    }
+
+
+# ==================== SCRAPING ====================
+
+def _collect_graphql_responses(driver, config):
+    """
+    Drain the current performance log and return parsed profile_info / reel_info.
+    The log is consumed (cleared) on each call so subsequent calls only see NEW
+    network events — avoids re-parsing the same entries on every scroll iteration.
+    """
+    result = {"profile_info": None, "reel_info": None}
+    for response in get_network_responses(driver):
+        try:
+            params = response.get("params", {})
+            resp   = params.get("response", {})
+            url    = resp.get("url", "")
+
+            if "graphql/query" not in url and "api/graphql" not in url:
+                continue
+
+            request_id = params.get("requestId")
+            if not request_id:
+                continue
+
+            body_obj = None
+            for attempt in range(2):
+                try:
+                    body_obj = driver.execute_cdp_cmd(
+                        "Network.getResponseBody", {"requestId": request_id}
+                    )
+                    break
+                except Exception:
+                    time.sleep(0.15)
+
+            if not body_obj:
+                continue
+
+            raw_body = body_obj.get("body", "")
+            if not raw_body or body_obj.get("base64Encoded"):
+                continue
+
+            response_body = json.loads(raw_body)
+            new_data = process_graphql_response(response_body, config)
+            if new_data["profile_info"] and not result["profile_info"]:
+                result["profile_info"] = new_data["profile_info"]
+            if new_data["reel_info"]:
+                result["reel_info"] = merge_timeline_data(
+                    result["reel_info"], new_data["reel_info"], config
+                )
+        except Exception:
+            continue
+    return result
+
+
+def scrape_profile(driver, url, config):
+    """
+    Step 1 — load profile page, capture profile GraphQL response (userInfo).
+    Step 2 — scroll to collect posts with visible likes+comments (postInfo).
+    """
+    username = get_username(url)
+    log_message(f"Scraping: @{username}")
+
+    try:
+        combined_data = {"profile_info": None, "reel_info": None, "login_wall": False}
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 1 — Capture profile_info (up to 3 attempts, fast retry)
+        # ══════════════════════════════════════════════════════════════════════
+        for attempt in range(1, 4):
+            driver.get("about:blank")
+            time.sleep(0.2)
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.get(url)
+            time.sleep(config.PAGE_LOAD_WAIT + (attempt - 1) * 0.8)
+
+            if "login" in driver.current_url.lower():
+                log_message(f"Login wall hit for @{username}", level="WARNING")
+                return {"profile_info": None, "reel_info": None, "login_wall": True}
+
+            # Trigger lazy-load without wasting time on a full scroll
+            driver.execute_script("window.scrollTo(0, 150);")
+            time.sleep(0.3)
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(0.2)
+
+            batch = _collect_graphql_responses(driver, config)
+
+            if batch["profile_info"]:
+                combined_data["profile_info"] = batch["profile_info"]
+                log_message(f"@{username} — profile_info captured (attempt {attempt})", level="SUCCESS")
+                if batch["reel_info"]:
+                    combined_data["reel_info"] = merge_timeline_data(
+                        combined_data["reel_info"], batch["reel_info"], config
+                    )
+                break
+            else:
+                log_message(f"@{username} — profile_info not found on attempt {attempt}/3, retrying...")
+
+        if not combined_data["profile_info"]:
+            log_message(f"@{username} — could not capture profile_info after 3 attempts", level="WARNING")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 2 — Scroll to collect posts
+        # ══════════════════════════════════════════════════════════════════════
+        log_message(f"@{username} — starting scroll for posts...")
+
+        posts_count     = 0
+        visible_count   = 0
+        no_new_posts    = 0
+        scroll_attempts = 0
+
+        if combined_data["reel_info"]:
+            try:
+                edges         = combined_data["reel_info"]["data"][config.TARGET_QUERIES["timeline"]]["edges"]
+                posts_count   = len(edges)
+                visible_count = count_visible_posts(edges)
+            except Exception:
+                pass
+
+        while scroll_attempts < config.MAX_SCROLL_ATTEMPTS and posts_count < config.MAX_POSTS:
+
+            if visible_count >= config.MAX_VISIBLE_POSTS:
+                log_message(
+                    f"@{username} — reached {visible_count} visible posts "
+                    f"(target {config.MAX_VISIBLE_POSTS}), stopping scroll",
+                    level="SUCCESS",
+                )
+                break
+
+            driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
+            time.sleep(random.uniform(config.SCROLL_PAUSE_MIN, config.SCROLL_PAUSE_MAX))
+
+            # Occasional up-scroll to un-stick lazy loaders
+            if scroll_attempts % 4 == 3:
+                driver.execute_script("window.scrollBy(0, -200);")
+                time.sleep(0.2)
+                driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
+
+            batch = _collect_graphql_responses(driver, config)
+            if batch["profile_info"] and not combined_data["profile_info"]:
+                combined_data["profile_info"] = batch["profile_info"]
+            if batch["reel_info"]:
+                combined_data["reel_info"] = merge_timeline_data(
+                    combined_data["reel_info"], batch["reel_info"], config
+                )
+
+            current_posts   = 0
+            current_visible = 0
+            if combined_data["reel_info"]:
+                try:
+                    edges           = combined_data["reel_info"]["data"][config.TARGET_QUERIES["timeline"]]["edges"]
+                    current_posts   = len(edges)
+                    current_visible = count_visible_posts(edges)
+                except Exception:
+                    pass
+
+            if current_posts == posts_count:
+                no_new_posts += 1
+                if no_new_posts >= config.MAX_NO_NEW_POSTS:
+                    log_message(
+                        f"@{username} — no new posts for {config.MAX_NO_NEW_POSTS} scrolls, "
+                        f"stopping at {current_posts} total / {current_visible} visible"
+                    )
+                    break
+            else:
+                no_new_posts  = 0
+                posts_count   = current_posts
+                visible_count = current_visible
+                log_message(
+                    f"@{username} — {posts_count} posts total | "
+                    f"{visible_count}/{config.MAX_VISIBLE_POSTS} with visible likes+comments"
+                )
+
+            if posts_count >= config.MAX_POSTS:
+                log_message(f"@{username} — raw post cap reached ({posts_count})", level="SUCCESS")
+                break
+
+            scroll_attempts += 1
+
+        # ── Post-process: attach location + metrics + mentions to every node ──
+        if combined_data["reel_info"]:
+            try:
+                edges = combined_data["reel_info"]["data"][config.TARGET_QUERIES["timeline"]]["edges"]
+                for edge in edges:
+                    node = edge.get("node", {})
+                    loc  = extract_location_data(node)
+                    if loc:
+                        node["processed_location"] = loc
+                    node["processed_metrics"]  = extract_post_metrics(node)
+                    node["processed_mentions"] = extract_mentions(node)
+            except Exception:
+                pass
+
+        return combined_data
+
+    except Exception as e:
+        log_message(f"Error scraping @{username}: {e}", level="ERROR")
+        return {"profile_info": None, "reel_info": None, "login_wall": False}
+
+
+# ==================== SAVING ====================
+
+def filter_visible_posts(reel_info, config):
+    try:
+        key   = config.TARGET_QUERIES["timeline"]
+        edges = reel_info["data"][key]["edges"]
+
+        visible_edges = [
+            e for e in edges
+            if has_visible_likes_and_comments(e.get("node", {}))
+        ][:config.MAX_VISIBLE_POSTS]
+
+        if not visible_edges:
+            return None
+
+        import copy
+        filtered                       = copy.deepcopy(reel_info)
+        filtered["data"][key]["edges"] = visible_edges
+        return filtered
+
+    except Exception as e:
+        log_message(f"Error filtering visible posts: {e}", level="ERROR")
+        return None
+
+
+def download_profile_picture(username, profile_info, save_dir):
+    """Download profile picture — no URL mutation (signed CDN URLs)."""
+    try:
+        user_data = profile_info["data"]["user"]
+        if isinstance(user_data, dict) and isinstance(user_data.get("data"), dict):
+            user_data = user_data["data"]
+
+        pic_url = (
+            user_data.get("profile_pic_url_hd")
+            or (user_data.get("hd_profile_pic_url_info") or {}).get("url")
+            or user_data.get("profile_pic_url")
+        )
+        if not pic_url:
+            log_message(f"No profile picture URL found for @{username}", level="WARNING")
+            return False
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer":    "https://www.instagram.com/",
+        }
+
+        for attempt in range(3):
+            try:
+                resp = requests.get(pic_url, stream=True, timeout=12, headers=headers)
+                if resp.status_code == 200:
+                    ct  = resp.headers.get("content-type", "").lower()
+                    ext = "jpg"
+                    if "png" in ct or ".png" in pic_url.lower():
+                        ext = "png"
+                    elif "webp" in ct or ".webp" in pic_url.lower():
+                        ext = "webp"
+
+                    file_path = os.path.join(save_dir, f"{username}.{ext}")
+                    with open(file_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                    if os.path.getsize(file_path) > 0:
+                        log_message(f"Profile picture saved: @{username} ({ext})", level="SUCCESS")
+                        return True
+                    os.remove(file_path)
+
+                elif resp.status_code == 404:
+                    return False
+                else:
+                    log_message(
+                        f"Profile picture HTTP {resp.status_code} for @{username} "
+                        f"(attempt {attempt + 1}/3)",
+                        level="WARNING",
+                    )
+            except Exception as e:
+                log_message(f"Profile picture download error for @{username}: {e}", level="WARNING")
+            if attempt < 2:
+                time.sleep(1.2 ** (attempt + 1))
+
+        return False
+    except Exception as e:
+        log_message(f"Unexpected error downloading picture for @{username}: {e}", level="ERROR")
+        return False
+
+
+def save_data(username, data, url, no_response_links, stats, done_urls, config,
+              csv_location=None):
+    if is_private_profile(data["profile_info"]) or not data["reel_info"]:
+        with stats_lock:
+            no_response_links.append(url)
+            stats["failed"] += 1
+        log_message(f"Private / no data: @{username}", level="WARNING")
+        return False
+
+    user_dir = f"output/{username}"
+    os.makedirs(user_dir, exist_ok=True)
+    success = False
+
+    if data["profile_info"]:
+        profile_to_save = dict(data["profile_info"])
+        if csv_location is not None:
+            profile_to_save["creator_location_from_csv"] = csv_location
+
+        with open(f"{user_dir}/userInfo.json", "w") as f:
+            json.dump(profile_to_save, f, indent=4)
+
+        with stats_lock:
+            stats["saved"] += 1
+        log_message(f"Profile saved: @{username}", level="SUCCESS")
+        success = True
+
+        threading.Thread(
+            target=_download_and_count,
+            args=(username, data["profile_info"], user_dir, stats),
+            daemon=True,
+        ).start()
+
+    if data["reel_info"]:
+        filtered_reel = filter_visible_posts(data["reel_info"], config)
+
+        if filtered_reel:
+            with open(f"{user_dir}/postInfo.json", "w") as f:
+                json.dump(filtered_reel, f, indent=4)
+
+            try:
+                edges          = filtered_reel["data"][config.TARGET_QUERIES["timeline"]]["edges"]
+                post_count     = len(edges)
+                location_count = sum(1 for e in edges if e.get("node", {}).get("processed_location"))
+                mention_count  = sum(
+                    len(e.get("node", {}).get("processed_mentions", []))
+                    for e in edges
+                )
+                with stats_lock:
+                    stats["posts_saved"]     += post_count
+                    stats["locations_found"] += location_count
+                log_message(
+                    f"Posts saved: @{username} — {post_count} posts with visible likes+comments "
+                    f"({location_count} with locations, {mention_count} total mentions)",
+                    level="SUCCESS",
+                )
+            except Exception:
+                pass
+        else:
+            log_message(
+                f"@{username} — no posts with both likes and comments visible; "
+                "postInfo.json not written",
+                level="WARNING",
+            )
+
+    if success:
+        with done_urls_lock:
+            done_urls.append(url)
+            _save_url_to_done_file(url, config)
+
+    return success
+
+
+def _download_and_count(username, profile_info, user_dir, stats):
+    if download_profile_picture(username, profile_info, user_dir):
+        with stats_lock:
+            stats["pictures_downloaded"] += 1
+
+
+def _save_url_to_done_file(url, config):
+    """Thread-safe write to done file + removal from input."""
+    try:
+        with file_write_lock:
+            if not os.path.exists(config.DONE_FILE):
+                with open(config.DONE_FILE, "w") as f:
+                    f.write("url\n")
+            with open(config.DONE_FILE, "a") as f:
+                f.write(f"{url}\n")
+            _remove_url_from_input(url, config)
+    except Exception as e:
+        log_message(f"Error managing done file: {e}", level="ERROR")
+
+
+def _remove_url_from_input(url, config):
+    try:
+        df = pd.read_csv(config.INPUT_FILE)
+        df = df[df["url"] != url]
+        df.to_csv(config.INPUT_FILE, index=False)
+    except Exception as e:
+        log_message(f"Error removing URL from input: {e}", level="ERROR")
+
+
+# ==================== WORKER ====================
+
+def worker_thread(worker_id, session_id, url_queue, config, stats,
+                  no_response_links, progress_bar, done_urls):
+    """
+    Each worker owns exactly one session_id and one persistent Chrome driver.
+    The driver is reused across all profiles — no teardown between profiles.
+    """
+    log_message(f"Worker-{worker_id} starting with session ...{session_id[-10:]}")
+    driver = configure_driver(session_id, config)
+
+    if not driver:
+        log_message(f"Worker-{worker_id} failed to start — no driver", level="ERROR")
+        return
+
+    try:
+        while True:
+            try:
+                url, csv_location = url_queue.get(block=False)
+            except queue.Empty:
+                break
+
+            try:
+                username = get_username(url)
+                log_message(f"Worker-{worker_id} processing: @{username}")
+
+                data = scrape_profile(driver, url, config)
+
+                if data.get("login_wall"):
+                    log_message(f"Worker-{worker_id} — login wall, reinitialising session", level="WARNING")
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    driver = configure_driver(session_id, config)
+                    if driver:
+                        data = scrape_profile(driver, url, config)
+
+                save_data(
+                    username, data, url,
+                    no_response_links, stats, done_urls, config,
+                    csv_location=csv_location,
+                )
+
+            except Exception as e:
+                log_message(f"Worker-{worker_id} error on @{get_username(url)}: {e}", level="ERROR")
+                with stats_lock:
+                    no_response_links.append(url)
+                    stats["failed"] += 1
+
+            finally:
+                progress_bar.update(1)
+                url_queue.task_done()
+                time.sleep(random.uniform(0.3, 0.8))
+
+    finally:
+        try:
+            driver.quit()
+            log_message(f"Worker-{worker_id} driver closed")
+        except Exception:
+            pass
+
+
+# ==================== URL LOADING ====================
+
+def load_urls(config):
+    try:
+        df = pd.read_csv(config.INPUT_FILE)
+        log_message(f"Loaded {len(df)} rows from {config.INPUT_FILE}")
+    except Exception as e:
+        log_message(f"Error reading input file: {e}", level="ERROR")
+        return [], []
+
+    if "url" not in [c.lower() for c in df.columns]:
+        log_message("Input CSV has no 'url' column", level="ERROR")
+        return [], []
+
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    done_urls = []
+    if os.path.exists(config.DONE_FILE):
+        try:
+            df_done   = pd.read_csv(config.DONE_FILE)
+            done_urls = [u.strip().rstrip("/") for u in df_done["url"].tolist()]
+            log_message(f"Already done: {len(done_urls)} URLs")
+        except Exception:
+            pass
+
+    done_set = set(done_urls)
+
+    pending = []
+    for _, row in df.iterrows():
+        url = str(row.get("url", "")).strip().rstrip("/")
+        if not url or url in done_set:
+            continue
+        username = get_username(url)
+        if os.path.exists(f"output/{username}"):
+            log_message(f"Skipping @{username} — folder already exists", level="INFO")
+            _save_url_to_done_file(url, config)
+            continue
+        csv_location = build_csv_location(row.to_dict())
+        pending.append((url, csv_location))
+
+    skipped = len(df) - len(pending)
+    log_message(f"Skipped: {skipped} | Pending: {len(pending)}")
+    return pending, done_urls
+
+
+# ==================== MAIN ====================
+
+def main(config):
+    log_message("=" * 70)
+    log_message("Instagram Multi-Session Scraper — Optimised v4")
+    log_message("=" * 70)
+
+    # Print binary detection result early so failures are obvious
+    bins = _get_bins()
+    if not bins.get("chrome") or not bins.get("chromedriver"):
+        log_message(
+            "Cannot find Chrome/chromedriver. Run:\n"
+            "  sudo apt install chromium-browser chromium-chromedriver\n"
+            "  OR: pip install webdriver-manager --break-system-packages",
+            level="ERROR",
+        )
+
+    effective_workers = min(config.MAX_WORKERS, len(config.SESSION_IDS))
+    if effective_workers < config.MAX_WORKERS:
+        log_message(
+            f"Workers capped to {effective_workers} "
+            f"(only {len(config.SESSION_IDS)} sessions available)",
+            level="WARNING",
+        )
+
+    log_message(
+        f"Sessions: {len(config.SESSION_IDS)} | "
+        f"Workers: {effective_workers} | "
+        f"Max Posts: {config.MAX_POSTS} | "
+        f"Max Visible Posts: {config.MAX_VISIBLE_POSTS} | "
+        f"Headless: {config.HEADLESS}"
+    )
+
+    if config.TEST_MODE:
+        log_message(f"TEST MODE: limiting to {config.MAX_TEST_PROFILES} profiles", level="WARNING")
+
+    stats = {
+        "total":               0,
+        "saved":               0,
+        "failed":              0,
+        "pictures_downloaded": 0,
+        "posts_saved":         0,
+        "locations_found":     0,
+    }
+
+    urls_to_process, done_urls = load_urls(config)
+
+    if config.TEST_MODE:
+        urls_to_process = urls_to_process[:config.MAX_TEST_PROFILES]
+
+    stats["total"] = len(urls_to_process)
+
+    if not urls_to_process:
+        log_message("No new URLs to process.", level="SUCCESS")
+        return
+
+    os.makedirs("output", exist_ok=True)
+
+    url_queue = queue.Queue()
+    for item in urls_to_process:
+        url_queue.put(item)
+
+    newly_completed = []
+    start_time      = time.time()
+
+    log_message(f"Launching {effective_workers} workers (1 session each)...")
+
+    with tqdm(
+        total=len(urls_to_process),
+        desc="Profiles",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+    ) as progress_bar:
+        threads = []
+        for worker_id in range(effective_workers):
+            session_id = config.SESSION_IDS[worker_id % len(config.SESSION_IDS)]
+            t = threading.Thread(
+                target=worker_thread,
+                args=(
+                    worker_id,
+                    session_id,
+                    url_queue,
+                    config,
+                    stats,
+                    [],
+                    progress_bar,
+                    newly_completed,
+                ),
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+            # Stagger worker starts so Chrome processes don't all fight for
+            # /dev/shm and ephemeral ports simultaneously
+            time.sleep(2.0)
+
+        url_queue.join()
+
+    for t in threads:
+        t.join(timeout=30)
+
+    elapsed = time.time() - start_time
+
+    log_message("=" * 70, level="SUCCESS")
+    log_message("DONE", level="SUCCESS")
+    log_message(f"Total:               {stats['total']}")
+    log_message(f"Saved:               {stats['saved']}",               level="SUCCESS")
+    log_message(f"Pictures:            {stats['pictures_downloaded']}")
+    log_message(f"Posts saved:         {stats['posts_saved']} (visible likes+comments only)")
+    log_message(f"With locations:      {stats['locations_found']}")
+    log_message(f"Failed:              {stats['failed']}",               level="WARNING")
+    log_message(f"Time:                {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    log_message(f"Avg/profile:         {elapsed/max(stats['total'],1):.1f}s")
+    log_message("=" * 70, level="SUCCESS")
+
+
+# ==================== .ENV SESSION LOADER ====================
+
+def _load_env_file(path):
+    """Parse a .env file and return a plain dict."""
+    env = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                env[key.strip()] = val.strip()
+    except FileNotFoundError:
+        pass
+    return env
+
+
+def load_sessions_from_env(env_path=None):
+    from pathlib import Path
+
+    if env_path is None:
+        env_path = Path(__file__).parent / ".env"
+
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=env_path, override=True)
+
+    sessions = []
+    i = 1
+    while True:
+        key = f"INSTA_SESSION_{i}"
+        val = os.environ.get(key, "").strip()
+        if key not in os.environ:
+            break
+        if val:
+            sessions.append(val)
+        i += 1
+
+    return sessions
+
+
+# ==================== BACKUP SESSION POOL ====================
+
+class BackupSessionPool:
+    """
+    Thread-safe queue of spare session IDs.
+    Workers call .get() when their current session hits a permanent login wall.
+    Returns None when the pool is exhausted.
+    """
+    def __init__(self, sessions):
+        self._lock = threading.Lock()
+        self._pool = list(sessions)
+
+    def get(self):
+        with self._lock:
+            return self._pool.pop(0) if self._pool else None
+
+    def remaining(self):
+        with self._lock:
+            return len(self._pool)
+
+
+# ==================== WORKER WITH BACKUP ROTATION ====================
+
+def worker_thread_with_backup(worker_id, session_id, url_queue, config, stats,
+                               no_response_links, progress_bar, done_urls,
+                               backup_pool):
+    """
+    Drop-in replacement for worker_thread that pulls a backup session from
+    backup_pool when the current session hits a login wall and cannot recover.
+
+    Rotation logic:
+      1. Login wall detected → restart driver with same session (first retry).
+      2. Still a login wall → pull next backup session from pool.
+      3. Pool exhausted → put URL back, shut down this worker.
+    """
+    log_message(f"Worker-{worker_id} starting with session ...{session_id[-10:]}")
+    driver = configure_driver(session_id, config)
+
+    if not driver:
+        log_message(f"Worker-{worker_id} failed to start — no driver", level="ERROR")
+        return
+
+    try:
+        while True:
+            try:
+                url, csv_location = url_queue.get(block=False)
+            except queue.Empty:
+                break
+
+            try:
+                username = get_username(url)
+                log_message(f"Worker-{worker_id} processing: @{username}")
+
+                data = scrape_profile(driver, url, config)
+
+                # ── Login-wall handling with backup rotation ──────────────────
+                if data.get("login_wall"):
+                    log_message(
+                        f"Worker-{worker_id} — login wall on session ...{session_id[-10:]}, "
+                        "retrying with same session first",
+                        level="WARNING",
+                    )
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+
+                    driver = configure_driver(session_id, config)
+                    if driver:
+                        data = scrape_profile(driver, url, config)
+
+                    # Still a login wall → swap to backup session
+                    if data.get("login_wall"):
+                        new_session = backup_pool.get()
+                        if new_session:
+                            log_message(
+                                f"Worker-{worker_id} — session ...{session_id[-10:]} permanently "
+                                f"dead. Switching to backup ...{new_session[-10:]}  "
+                                f"({backup_pool.remaining()} backups left)",
+                                level="WARNING",
+                            )
+                            session_id = new_session
+                            try:
+                                driver.quit()
+                            except Exception:
+                                pass
+                            driver = configure_driver(session_id, config)
+                            if driver:
+                                data = scrape_profile(driver, url, config)
+                        else:
+                            log_message(
+                                f"Worker-{worker_id} — backup pool exhausted, shutting down worker",
+                                level="ERROR",
+                            )
+                            url_queue.put((url, csv_location))
+                            url_queue.task_done()
+                            return
+
+                save_data(
+                    username, data, url,
+                    no_response_links, stats, done_urls, config,
+                    csv_location=csv_location,
+                )
+
+            except Exception as e:
+                log_message(f"Worker-{worker_id} error on @{get_username(url)}: {e}", level="ERROR")
+                with stats_lock:
+                    no_response_links.append(url)
+                    stats["failed"] += 1
+
+            finally:
+                progress_bar.update(1)
+                url_queue.task_done()
+                time.sleep(random.uniform(0.3, 0.8))
+
+    finally:
+        try:
+            driver.quit()
+            log_message(f"Worker-{worker_id} driver closed")
+        except Exception:
+            pass
+
+
+# ==================== MAIN WITH .ENV (primary entry point) ====================
+
+def main_with_env(env_path=None):
+    """
+    Entry point used by run_pipeline.py (Step 1) and __main__.
+    Reads all INSTA_SESSION_* from .env, assigns the first 5 to active workers,
+    puts the rest in a BackupSessionPool for automatic rotation.
+    """
+    MAX_ACTIVE_WORKERS = 5
+
+    all_sessions = load_sessions_from_env(env_path)
+    if not all_sessions:
+        log_message(
+            "No INSTA_SESSION_* entries found in .env — run session_login.py first.",
+            level="ERROR",
+        )
+        raise SystemExit(1)
+
+    active_sessions = all_sessions[:MAX_ACTIVE_WORKERS]
+    backup_sessions = all_sessions[MAX_ACTIVE_WORKERS:]
+    backup_pool     = BackupSessionPool(backup_sessions)
+
+    log_message(
+        f"Sessions loaded from .env — "
+        f"active: {len(active_sessions)}, backup pool: {len(backup_sessions)}"
+    )
+
+    config = ScraperConfig(
+        SESSION_IDS=active_sessions,
+        MAX_WORKERS=len(active_sessions),
+        MAX_POSTS=35,
+        MAX_VISIBLE_POSTS=25,
+        HEADLESS=True,
+        INPUT_FILE="input.csv",
+        DONE_FILE="inputdone.csv",
+        TEST_MODE=False,
+        MAX_TEST_PROFILES=5,
+    )
+
+    log_message("=" * 70)
+    log_message("Instagram Multi-Session Scraper — with .env session + backup pool")
+    log_message("=" * 70)
+
+    # Print binary detection early so any missing-driver problems are obvious
+    bins = _get_bins()
+    if not bins.get("chrome") or not bins.get("chromedriver"):
+        log_message(
+            "Cannot find Chrome/chromedriver. Fix with:\n"
+            "  sudo apt install chromium-browser chromium-chromedriver\n"
+            "  OR: pip install webdriver-manager --break-system-packages",
+            level="ERROR",
+        )
+        raise SystemExit(1)
+
+    effective_workers = min(config.MAX_WORKERS, len(config.SESSION_IDS))
+    log_message(
+        f"Sessions: {len(config.SESSION_IDS)} active | "
+        f"Backup pool: {backup_pool.remaining()} | "
+        f"Workers: {effective_workers} | "
+        f"Max Posts: {config.MAX_POSTS} | "
+        f"Headless: {config.HEADLESS}"
+    )
+
+    stats = {
+        "total":               0,
+        "saved":               0,
+        "failed":              0,
+        "pictures_downloaded": 0,
+        "posts_saved":         0,
+        "locations_found":     0,
+    }
+
+    urls_to_process, done_urls = load_urls(config)
+
+    if config.TEST_MODE:
+        urls_to_process = urls_to_process[:config.MAX_TEST_PROFILES]
+
+    stats["total"] = len(urls_to_process)
+
+    if not urls_to_process:
+        log_message("No new URLs to process.", level="SUCCESS")
+        return
+
+    os.makedirs("output", exist_ok=True)
+
+    url_queue = queue.Queue()
+    for item in urls_to_process:
+        url_queue.put(item)
+
+    start_time = time.time()
+    log_message(f"Launching {effective_workers} workers (1 dedicated session each)...")
+
+    with tqdm(
+        total=len(urls_to_process),
+        desc="Profiles",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+    ) as progress_bar:
+        threads = []
+        for worker_id in range(effective_workers):
+            session_id = config.SESSION_IDS[worker_id]
+            t = threading.Thread(
+                target=worker_thread_with_backup,
+                args=(
+                    worker_id,
+                    session_id,
+                    url_queue,
+                    config,
+                    stats,
+                    [],
+                    progress_bar,
+                    done_urls,
+                    backup_pool,
+                ),
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+            # Stagger starts — avoids simultaneous Chrome launches racing on
+            # /dev/shm and ephemeral ports on constrained servers
+            time.sleep(2.0)
+
+        url_queue.join()
+
+    for t in threads:
+        t.join(timeout=30)
+
+    elapsed = time.time() - start_time
+
+    log_message("=" * 70, level="SUCCESS")
+    log_message("DONE", level="SUCCESS")
+    log_message(f"Total:               {stats['total']}")
+    log_message(f"Saved:               {stats['saved']}",               level="SUCCESS")
+    log_message(f"Pictures:            {stats['pictures_downloaded']}")
+    log_message(f"Posts saved:         {stats['posts_saved']} (visible likes+comments only)")
+    log_message(f"With locations:      {stats['locations_found']}")
+    log_message(f"Failed:              {stats['failed']}",               level="WARNING")
+    log_message(f"Time:                {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    log_message(f"Avg/profile:         {elapsed/max(stats['total'],1):.1f}s")
+    log_message("=" * 70, level="SUCCESS")
+
+
+if __name__ == "__main__":
+    main_with_env()
