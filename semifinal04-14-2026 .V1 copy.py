@@ -16,9 +16,9 @@ import re
 # ==================== CONFIGURATION ====================
 class Config:
     SESSION_IDS = [
-        "78524688621%3Aoqgv2pZ9cI7m0I%3A27%3AAYjWsANe7EObEu9XAEl0bxcO5VjpqyctHNOjdrOFdA",
-        "79094843931%3A2LO8YBAJ0BPwsG%3A29%3AAYiqLMBzHL6R0qBgSBmRoXKgK3DIwlh3NmgDrWI_dw",
-        "78639983601%3AXVwHy9YtHDyTs9%3A13%3AAYjxCxDr2QjIgk17tzGti1kdMQa-bmIwk4UNtc_mWQ",
+       "",
+        "",
+        "",
     ]
     MAX_WORKERS     = 2       # Keep low to avoid rate limits
     MAX_VIDEOS      = 99   # Effectively unlimited — get everything
